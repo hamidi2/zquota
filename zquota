@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""zquota — شخصی: مشاهده و مصرف reset quota اکانت‌های z.ai از خط فرمان.
+
+همان کاری که ZCode انجام می‌دهد، فقط read-only + resetهای موجود خود اکانت.
+توکن‌ها فقط روی همین سیستم، در ~/.config/zquota/accounts.json با دسترسی 0600 ذخیره می‌شوند.
+"""
+import base64
+import hashlib
+import json
+import os
+import sys
+import time
+import urllib.request
+import urllib.error
+import uuid
+from pathlib import Path
+
+CREDS = Path.home() / ".zcode" / "v2" / "credentials.json"
+STORE = Path.home() / ".config" / "zquota" / "accounts.json"
+BASE_RESET = "https://zcode.z.ai/api/v1/coding-plan/reset"
+BASE_QUOTA = "https://api.z.ai/api/monitor/usage/quota/limit"
+
+# ---------- crypto (همان طرح ZCode: enc:v1 = iv.tag.ct ، AES-256-GCM) ----------
+
+def _secret():
+    s = os.environ.get("ZCODE_CREDENTIAL_SECRET")
+    if s:
+        return s
+    try:
+        import pwd
+        user = pwd.getpwuid(os.getuid()).pw_name
+    except Exception:
+        user = "unknown"
+    # node os.platform() → 'linux'؛ sys.platform همین فرمت را می‌دهد
+    return f"zcode-credential-fallback:{sys.platform}:{Path.home()}:{user}"
+
+def _key():
+    return hashlib.sha256(_secret().encode()).digest()
+
+def _b64(p):
+    return base64.urlsafe_b64decode(p + "=" * (-len(p) % 4))
+
+def decrypt(v):
+    if not v.startswith("enc:v1:"):
+        return v
+    a, c, u = v[6:].split(".")
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    return AESGCM(_key()).decrypt(_b64(a), _b64(u) + _b64(c), None).decode()
+
+# ---------- accounts ----------
+
+def load_active():
+    """اکانت(های) لاگین‌شدهٔ فعلی ZCode."""
+    if not CREDS.exists():
+        return []
+    d = json.loads(CREDS.read_text())
+    out = []
+    try:
+        ui = json.loads(decrypt(d["oauth:zai:user_info"]))
+        tok = decrypt(d["zcodejwttoken"])
+        zai = decrypt(d["oauth:zai:access_token"])
+        out.append({
+            "id": ui.get("user_id", "unknown"),
+            "name": ui.get("name") or ui.get("email", "unknown"),
+            "email": ui.get("email", ""),
+            "zcode_jwt": tok,
+            "zai_token": zai,
+        })
+    except Exception as e:
+        print(f"! خواندن اکانت فعال ناموفق: {e}", file=sys.stderr)
+    return out
+
+def load_saved():
+    if STORE.exists():
+        os.chmod(STORE, 0o600)
+        return json.loads(STORE.read_text())
+    return {}
+
+def save_accounts(accounts):
+    STORE.parent.mkdir(parents=True, exist_ok=True)
+    STORE.write_text(json.dumps(accounts, indent=1, ensure_ascii=False))
+    os.chmod(STORE, 0o600)
+
+def all_accounts():
+    """saved + فعال (فعال اولویت دارد؛ با توکن تازه)."""
+    saved = load_saved()
+    for a in load_active():
+        saved[a["id"]] = a
+    return list(saved.values())
+
+# ---------- API ----------
+
+def api(url, acc, method="GET", body=None):
+    if "/monitor/usage/quota/limit" in url:
+        # این endpoint فقط توکن z.ai را بدون Bearer می‌پذیرد
+        h = {"authorization": acc["zai_token"]}
+    else:
+        h = {
+            "Authorization": f"Bearer {acc['zcode_jwt']}",
+            "X-Bigmodel-Authorization": acc["zai_token"],
+            "Bigmodel-Target-Type": "PERSONAL",
+        }
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        h["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=h, method=method)
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read())
+
+def reset_status(acc):
+    d = api(f"{BASE_RESET}/status", acc)["data"]
+    return {
+        "five_hour": [x["expire_at"] for x in d["available_five_hour_resets"]],
+        "week": [x["expire_at"] for x in d["available_week_resets"]],
+    }
+
+def quota(acc):
+    d = api(BASE_QUOTA, acc)
+    if d.get("code") != 200:
+        return None
+    lim = {x["unit"]: x for x in d["data"]["limits"]}  # unit 3=5h, 6=weekly
+    return lim
+
+def fmt_ts(ms):
+    if not ms:
+        return "-"
+    dt = ms / 1000 - time.time()
+    if dt <= 0:
+        return "الان"
+    m, h = int(dt // 60) % 60, int(dt // 3600)
+    return f"{h}ساعت {m}دقیقه" if h else f"{m}دقیقه"
+
+# ---------- commands ----------
+
+def cmd_accounts():
+    for a in all_accounts():
+        act = load_active()
+        tag = " (فعال در ZCode)" if act and a["id"] == act[0]["id"] else ""
+        print(f"  {a['id'][:8]}  {a['name']}  <{a['email']}>{tag}")
+    if not all_accounts():
+        print("هیچ اکانتی یافت نشد.")
+
+def cmd_save():
+    act = load_active()
+    if not act:
+        sys.exit("اکانت فعالی یافت نشد.")
+    saved = load_saved()
+    for a in act:
+        saved[a["id"]] = a
+        print(f"ذخیره شد: {a['name']} <{a['email']}>")
+    save_accounts(saved)
+
+def show_status(a):
+    try:
+        s = reset_status(a)
+    except urllib.error.HTTPError as e:
+        print(f"  {a['name']}: خطا HTTP {e.code}")
+        return
+    print(f"▪ {a['name']} <{a['email']}>")
+    try:
+        q = quota(a)
+    except Exception:
+        q = None
+    if q:
+        for unit, label in ((3, "5-hour"), (6, "weekly")):
+            if unit in q:
+                x = q[unit]
+                remaining = 100 - x["percentage"]  # percentage سرور = مصرف‌شده
+                print(f"   {label:7s}: {remaining:3d}% مانده، reset بعدی تا {fmt_ts(x.get('nextResetTime'))}")
+    print(f"   Reset آماده: هفتگی ×{len(s['week'])}", end="")
+    if s["week"]:
+        print(f"  (نزدیک‌ترین انقضا تا {fmt_ts(min(s['week']))})", end="")
+    print(f" | ۵ساعته ×{len(s['five_hour'])}")
+
+def cmd_status():
+    for a in all_accounts():
+        show_status(a)
+
+def cmd_reset(name=None, rtype=None, yes=False):
+    accs = all_accounts()
+    if not accs:
+        sys.exit("اکانتی یافت نشد.")
+    acc = accs[0]
+    if name or len(accs) > 1:
+        for i, a in enumerate(accs, 1):
+            print(f" {i}) {a['name']} <{a['email']}>")
+        idx = name or input("شماره اکانت: ")
+        acc = accs[int(idx) - 1]
+    s = reset_status(acc)
+    avail = [("week", s["week"]), ("five_hour", s["five_hour"])]
+    avail = [(t, v) for t, v in avail if v]
+    if not avail:
+        sys.exit(f"Reset آماده‌ای برای {acc['name']} وجود ندارد.")
+    if not rtype:
+        for i, (t, v) in enumerate(avail, 1):
+            print(f" {i}) {t} ×{len(v)}")
+        rtype = avail[int(input("کدام reset؟ ")) - 1][0]
+    if rtype not in ("week", "five_hour"):
+        sys.exit("نوع نامعتبر (week | five_hour)")
+    if not yes:
+        r = input(f"مصرف یک reset {rtype} برای {acc['name']}؟ [y/N] ")
+        if r.strip().lower() not in ("y", "yes"):
+            sys.exit("لغو شد.")
+    api(f"{BASE_RESET}/use", acc, method="POST",
+        body={"idempotency_key": uuid.uuid4().hex, "reset_type": rtype})
+    print(f"✅ Reset {rtype} برای {acc['name']} اجرا شد.")
+    show_status(acc)
+
+def cmd_reset_now(acc, rtype):
+    """مصرف بدون تعامل (برای watch)."""
+    api(f"{BASE_RESET}/use", acc, method="POST",
+        body={"idempotency_key": uuid.uuid4().hex, "reset_type": rtype})
+
+def cmd_watch(threshold_min=2.0, interval_sec=60, dry_run=False):
+    """هر reset که ≤threshold دقیقه به انقضایش مانده، بی‌قیدوشرط مصرف می‌شود."""
+    print(f"watch شروع شد (همهٔ اکانت‌ها): resetهایی که ≤{threshold_min} دقیقه به انقضایشان مانده "
+          f"خودکار مصرف می‌شوند. بررسی هر {interval_sec} ثانیه." + (" [DRY-RUN]" if dry_run else ""))
+    while True:
+        try:
+            for a in all_accounts():
+                s = reset_status(a)
+                now = time.time() * 1000
+                for rtype in ("week", "five_hour"):
+                    exp = s[rtype]
+                    if not exp:
+                        continue
+                    if min(exp) - now > threshold_min * 60000:
+                        continue
+                    ts = time.strftime("%H:%M")
+                    if dry_run:
+                        print(f"[{ts}] [DRY] {a['name']}: reset {rtype} مصرف می‌شد.")
+                        continue
+                    try:
+                        cmd_reset_now(a, rtype)
+                        print(f"[{ts}] ✅ reset {rtype} برای {a['name']} مصرف شد (≤{threshold_min:g} دقیقه به انقضا).")
+                    except urllib.error.HTTPError as e:
+                        print(f"[{ts}] ! خطای HTTP {e.code} در مصرف {rtype} ({a['name']})")
+        except Exception as e:
+            print(f"[{time.strftime('%H:%M')}] ! خطا: {e}")
+        time.sleep(interval_sec)
+
+def main():
+    os.umask(0o077)
+    args = sys.argv[1:]
+    if not args or args[0] in ("status", "s"):
+        cmd_status()
+    elif args[0] == "accounts":
+        cmd_accounts()
+    elif args[0] == "watch":
+        thr, itv, dry = 2.0, 60, False
+        if "--min" in args:
+            thr = float(args[args.index("--min") + 1])
+        if "--interval" in args:
+            itv = int(args[args.index("--interval") + 1])
+        dry = "--dry-run" in args
+        cmd_watch(thr, itv, dry)
+    elif args[0] == "save":
+        cmd_save()
+    elif args[0] == "reset":
+        name = args[1] if len(args) > 1 else None
+        rtype = args[2] if len(args) > 2 else None
+        yes = "-y" in args
+        if yes:
+            rest = [a for a in args[1:] if a != "-y"]
+            name, rtype = (rest + [None, None])[:2]
+        cmd_reset(name, rtype, yes)
+    elif args[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        print("""دستورها:
+  zquota status            وضعیت سهمیه و resetهای همهٔ اکانت‌ها
+  zquota accounts          فهرست اکانت‌ها
+  zquota save              ذخیرهٔ توکن اکانت فعلی ZCode در zquota
+                           (برای چند-اکانتی: در ZCode با اکانت دوم لاگین کن، بعد zquota save)
+  zquota reset [n] [type] [-y]
+                           مصرف دستی؛ type = week | five_hour
+  zquota watch [--min 2] [--interval 60] [--dry-run]
+                           پایش دائمی: فقط ≤2 دقیقه به انقضا، بی‌قید مصرف می‌شود""")
+    else:
+        sys.exit(f"دستور ناشناس: {args[0]} — help را ببین.")
+
+if __name__ == "__main__":
+    main()
