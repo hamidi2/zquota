@@ -2,13 +2,13 @@
 # zquota setup — installs the CLI and the watch service (idempotent)
 set -euo pipefail
 
-BIN="$HOME/.local/bin/zquota"
+BIN="$HOME/bin/zquota"
 SVC_DIR="$HOME/.config/systemd/user"
 SVC="$SVC_DIR/zquota-watch.service"
 STATE="$HOME/.local/state"
 SRC="$(cd "$(dirname "$0")" && pwd)/zquota"
 
-mkdir -p "$HOME/.local/bin" "$SVC_DIR" "$STATE"
+mkdir -p "$HOME/bin" "$SVC_DIR" "$STATE"
 
 # dependency
 python3 -c 'import cryptography' 2>/dev/null || pip3 install --user cryptography
