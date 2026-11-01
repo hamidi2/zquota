@@ -113,6 +113,8 @@ def reset_status(acc):
     return {
         "five_hour": [x["expire_at"] for x in d["available_five_hour_resets"]],
         "week": [x["expire_at"] for x in d["available_week_resets"]],
+        "last_five_hour_used": (d.get("latest_five_hour_reset_history") or {}).get("used_at"),
+        "last_week_used": (d.get("latest_week_reset_history") or {}).get("used_at"),
     }
 
 def quota(acc):
@@ -172,6 +174,9 @@ def show_status(a):
     if s["week"]:
         print(f"  (soonest expires in {fmt_ts(min(s['week']))})", end="")
     print(f" | 5-hour ×{len(s['five_hour'])}")
+    for label, t in (("weekly", s["last_week_used"]), ("5-hour", s["last_five_hour_used"])):
+        if t:
+            print(f"   last spent ({label}): {fmt_ts(t)}")
 
 def cmd_status():
     for a in all_accounts():
