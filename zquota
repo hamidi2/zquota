@@ -19,6 +19,8 @@ CREDS = Path.home() / ".zcode" / "v2" / "credentials.json"
 STORE = Path.home() / ".config" / "zquota" / "accounts.json"
 BASE_RESET = "https://zcode.z.ai/api/v1/coding-plan/reset"
 BASE_QUOTA = "https://api.z.ai/api/monitor/usage/quota/limit"
+# server expects uppercase reset types (verified: lowercase => "3001 parameter error")
+SERVER_RESET_TYPE = {"week": "WEEK", "five_hour": "FIVE_HOUR"}
 
 # ---------- crypto (same scheme as ZCode: enc:v1 = iv.tag.ct, AES-256-GCM) ----------
 
@@ -208,16 +210,53 @@ def cmd_reset(name=None, rtype=None, yes=False):
         if r.strip().lower() not in ("y", "yes"):
             sys.exit("Cancelled.")
     api(f"{BASE_RESET}/use", acc, method="POST",
-        body={"idempotency_key": uuid.uuid4().hex, "reset_type": rtype})
+        body={"idempotency_key": uuid.uuid4().hex, "reset_type": SERVER_RESET_TYPE[rtype]})
     print(f"✅ Reset {rtype} reset for {acc['name']} done.")
     show_status(acc)
 
 def cmd_reset_now(acc, rtype):
     """Non-interactive spend (used by watch)."""
     api(f"{BASE_RESET}/use", acc, method="POST",
-        body={"idempotency_key": uuid.uuid4().hex, "reset_type": rtype})
+        body={"idempotency_key": uuid.uuid4().hex, "reset_type": SERVER_RESET_TYPE[rtype]})
 
-def cmd_watch(threshold_min=5.0, interval_sec=60, dry_run=False):
+def cmd_probe():
+    """Diagnostics: clock skew vs server, account auth, reset-endpoint sanity.
+    Safe: never spends anything (probes only run while no five_hour reset is available)."""
+    from email.utils import parsedate_to_datetime
+    for a in all_accounts():
+        print(f"▪ {a['email']}")
+        req = urllib.request.Request(f"{BASE_RESET}/status", headers={
+            "Authorization": f"Bearer {a['zcode_jwt']}",
+            "X-Bigmodel-Authorization": a["zai_token"],
+            "Bigmodel-Target-Type": "PERSONAL"})
+        t0 = time.time()
+        with urllib.request.urlopen(req, timeout=20) as r:
+            body = r.read()
+        t1 = time.time()
+        skew = parsedate_to_datetime(r.headers.get("Date")).timestamp() - (t0 + t1) / 2
+        d = json.loads(body)["data"]
+        n5, nw = len(d["available_five_hour_resets"]), len(d["available_week_resets"])
+        print(f"   auth: OK | server clock skew: {skew:+.1f}s | available: 5h×{n5} week×{nw}")
+        for k in ("latest_five_hour_reset_history", "latest_week_reset_history"):
+            h = d.get(k)
+            if h:
+                print(f"   last {k[7:-8]} spend: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(h['used_at']/1000))}")
+        if n5 == 0:
+            # safe: type-validity probe with nothing to spend (expect non-3001 response)
+            try:
+                api(f"{BASE_RESET}/use", a, method="POST",
+                    body={"idempotency_key": uuid.uuid4().hex, "reset_type": "FIVE_HOUR"})
+                print("   probe: UNEXPECTED success (check!)")
+            except urllib.error.HTTPError as e:
+                body = e.read().decode(errors="replace")[:120]
+                tag = "type accepted (server processing error on empty set)" if '"code":3001' not in body else "3001 PARAM ERROR - server rejects type! (update zquota)"
+                print(f"   probe: HTTP {e.code} {body.strip()} -> {tag}")
+            except Exception as e:
+                print(f"   probe: {e}")
+        else:
+            print("   probe: skipped (five_hour reset available - not spending it)")
+
+def cmd_watch(threshold_min=5.0, interval_sec=30, dry_run=False):
     """Spend any reset with <=threshold minutes left before its expiry, unconditionally.
     Errors are logged with the full server response; retries continue every cycle until expiry."""
     print(f"watch started (all accounts): resets with <= {threshold_min:g} min left before expiry "
@@ -265,13 +304,15 @@ def main():
     elif args[0] == "accounts":
         cmd_accounts()
     elif args[0] == "watch":
-        thr, itv, dry = 5.0, 60, False
+        thr, itv, dry = 5.0, 30, False
         if "--min" in args:
             thr = float(args[args.index("--min") + 1])
         if "--interval" in args:
             itv = int(args[args.index("--interval") + 1])
         dry = "--dry-run" in args
         cmd_watch(thr, itv, dry)
+    elif args[0] == "probe":
+        cmd_probe()
     elif args[0] == "save":
         cmd_save()
     elif args[0] == "reset":
@@ -292,7 +333,8 @@ def main():
                            run zquota save; supports any number of accounts)
   zquota reset [n] [type] [-y]
                            spend a reset manually; type = week | five_hour
-  zquota watch [--min 5] [--interval 60] [--dry-run]
+  zquota probe              diagnostics: clock skew, auth, reset-endpoint sanity (safe)
+  zquota watch [--min 5] [--interval 30] [--dry-run]
                            daemon: only spends resets within --min minutes of expiry (errors logged in detail)""")
     else:
         sys.exit(f"unknown command: {args[0]}  — see help.")
