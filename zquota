@@ -217,32 +217,44 @@ def cmd_reset_now(acc, rtype):
     api(f"{BASE_RESET}/use", acc, method="POST",
         body={"idempotency_key": uuid.uuid4().hex, "reset_type": rtype})
 
-def cmd_watch(threshold_min=2.0, interval_sec=60, dry_run=False):
-    """Spend any reset with <=threshold minutes left before its expiry, unconditionally."""
+def cmd_watch(threshold_min=5.0, interval_sec=60, dry_run=False):
+    """Spend any reset with <=threshold minutes left before its expiry, unconditionally.
+    Errors are logged with the full server response; retries continue every cycle until expiry."""
     print(f"watch started (all accounts): resets with <= {threshold_min:g} min left before expiry "
-          f"are spent automatically. Checking every {interval_sec}s." + (" [DRY-RUN]" if dry_run else ""))
+          f"are spent automatically (retried every cycle until expiry). Checking every {interval_sec}s."
+          + (" [DRY-RUN]" if dry_run else ""), flush=True)
     while True:
         try:
             for a in all_accounts():
-                s = reset_status(a)
+                try:
+                    s = reset_status(a)
+                except Exception as e:
+                    print(f"[{time.strftime('%H:%M:%S')}] ! {a['email']}: failed to read status: {e}", flush=True)
+                    continue
                 now = time.time() * 1000
                 for rtype in ("week", "five_hour"):
                     exp = s[rtype]
                     if not exp:
                         continue
-                    if min(exp) - now > threshold_min * 60000:
+                    soonest = min(exp)
+                    remain_min = (soonest - now) / 60000
+                    if remain_min > threshold_min:
                         continue
-                    ts = time.strftime("%H:%M")
+                    ts = time.strftime("%H:%M:%S")
                     if dry_run:
-                        print(f"[{ts}] [DRY] {a['name']}: reset {rtype} would be spent.")
+                        print(f"[{ts}] [DRY] {a['email']}: {rtype} reset would be spent ({remain_min:.1f} min left).", flush=True)
                         continue
                     try:
                         cmd_reset_now(a, rtype)
-                        print(f"[{ts}] ✅ reset {rtype} reset for {a['name']} spent (≤{threshold_min:g} m to expiry).")
+                        print(f"[{ts}] OK {rtype} reset spent for {a['email']} ({remain_min:.1f} min before expiry).", flush=True)
                     except urllib.error.HTTPError as e:
-                        print(f"[{ts}] ! HTTP error {e.code} spending {rtype} ({a['name']})")
+                        body = e.read().decode(errors="replace")[:300]
+                        print(f"[{ts}] ! {a['email']}: spending {rtype} failed - HTTP {e.code}: {body}"
+                              f" ({remain_min:.1f} min to expiry; will retry next cycle)", flush=True)
+                    except Exception as e:
+                        print(f"[{ts}] ! {a['email']}: spending {rtype} failed: {e}", flush=True)
         except Exception as e:
-            print(f"[{time.strftime('%H:%M')}] ! error: {e}")
+            print(f"[{time.strftime('%H:%M:%S')}] ! error: {e}", flush=True)
         time.sleep(interval_sec)
 
 def main():
@@ -253,7 +265,7 @@ def main():
     elif args[0] == "accounts":
         cmd_accounts()
     elif args[0] == "watch":
-        thr, itv, dry = 2.0, 60, False
+        thr, itv, dry = 5.0, 60, False
         if "--min" in args:
             thr = float(args[args.index("--min") + 1])
         if "--interval" in args:
@@ -280,8 +292,8 @@ def main():
                            run zquota save; supports any number of accounts)
   zquota reset [n] [type] [-y]
                            spend a reset manually; type = week | five_hour
-  zquota watch [--min 2] [--interval 60] [--dry-run]
-                           daemon: only spends resets within --min minutes of expiry""")
+  zquota watch [--min 5] [--interval 60] [--dry-run]
+                           daemon: only spends resets within --min minutes of expiry (errors logged in detail)""")
     else:
         sys.exit(f"unknown command: {args[0]}  — see help.")
 
