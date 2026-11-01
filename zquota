@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""zquota — شخصی: مشاهده و مصرف reset quota اکانت‌های z.ai از خط فرمان.
+"""zquota — Unofficial CLI: view and spend your z.ai GLM Coding Plan gift quota-reset tokens.
 
-همان کاری که ZCode انجام می‌دهد، فقط read-only + resetهای موجود خود اکانت.
-توکن‌ها فقط روی همین سیستم، در ~/.config/zquota/accounts.json با دسترسی 0600 ذخیره می‌شوند.
+Reuses the tokens ZCode stores on this machine; read-only, plus spending resets that already belong to the account.
+Tokens never leave this machine (stored in ~/.config/zquota/accounts.json, mode 0600).
 """
 import base64
 import hashlib
@@ -20,7 +20,7 @@ STORE = Path.home() / ".config" / "zquota" / "accounts.json"
 BASE_RESET = "https://zcode.z.ai/api/v1/coding-plan/reset"
 BASE_QUOTA = "https://api.z.ai/api/monitor/usage/quota/limit"
 
-# ---------- crypto (همان طرح ZCode: enc:v1 = iv.tag.ct ، AES-256-GCM) ----------
+# ---------- crypto (same scheme as ZCode: enc:v1 = iv.tag.ct, AES-256-GCM) ----------
 
 def _secret():
     s = os.environ.get("ZCODE_CREDENTIAL_SECRET")
@@ -31,7 +31,7 @@ def _secret():
         user = pwd.getpwuid(os.getuid()).pw_name
     except Exception:
         user = "unknown"
-    # node os.platform() → 'linux'؛ sys.platform همین فرمت را می‌دهد
+    # must match node's os.platform() spelling ('linux', not 'Linux')
     return f"zcode-credential-fallback:{sys.platform}:{Path.home()}:{user}"
 
 def _key():
@@ -50,7 +50,7 @@ def decrypt(v):
 # ---------- accounts ----------
 
 def load_active():
-    """اکانت(های) لاگین‌شدهٔ فعلی ZCode."""
+    """Account(s) currently logged in via ZCode."""
     if not CREDS.exists():
         return []
     d = json.loads(CREDS.read_text())
@@ -67,7 +67,7 @@ def load_active():
             "zai_token": zai,
         })
     except Exception as e:
-        print(f"! خواندن اکانت فعال ناموفق: {e}", file=sys.stderr)
+        print(f"! failed to read active account: {e}", file=sys.stderr)
     return out
 
 def load_saved():
@@ -82,7 +82,7 @@ def save_accounts(accounts):
     os.chmod(STORE, 0o600)
 
 def all_accounts():
-    """saved + فعال (فعال اولویت دارد؛ با توکن تازه)."""
+    """saved + active accounts (the active one wins, with fresh tokens)."""
     saved = load_saved()
     for a in load_active():
         saved[a["id"]] = a
@@ -92,7 +92,7 @@ def all_accounts():
 
 def api(url, acc, method="GET", body=None):
     if "/monitor/usage/quota/limit" in url:
-        # این endpoint فقط توکن z.ai را بدون Bearer می‌پذیرد
+        # this endpoint only accepts the raw z.ai token, without the Bearer prefix
         h = {"authorization": acc["zai_token"]}
     else:
         h = {
@@ -127,35 +127,35 @@ def fmt_ts(ms):
         return "-"
     dt = ms / 1000 - time.time()
     if dt <= 0:
-        return "الان"
+        return "now"
     m, h = int(dt // 60) % 60, int(dt // 3600)
-    return f"{h}ساعت {m}دقیقه" if h else f"{m}دقیقه"
+    return f"{h}h {m}m" if h else f"{m}m"
 
 # ---------- commands ----------
 
 def cmd_accounts():
     for a in all_accounts():
         act = load_active()
-        tag = " (فعال در ZCode)" if act and a["id"] == act[0]["id"] else ""
+        tag = " (active in ZCode)" if act and a["id"] == act[0]["id"] else ""
         print(f"  {a['id'][:8]}  {a['name']}  <{a['email']}>{tag}")
     if not all_accounts():
-        print("هیچ اکانتی یافت نشد.")
+        print("No accounts found.")
 
 def cmd_save():
     act = load_active()
     if not act:
-        sys.exit("اکانت فعالی یافت نشد.")
+        sys.exit("No active account found.")
     saved = load_saved()
     for a in act:
         saved[a["id"]] = a
-        print(f"ذخیره شد: {a['name']} <{a['email']}>")
+        print(f"saved: {a['name']} <{a['email']}>")
     save_accounts(saved)
 
 def show_status(a):
     try:
         s = reset_status(a)
     except urllib.error.HTTPError as e:
-        print(f"  {a['name']}: خطا HTTP {e.code}")
+        print(f"  {a['name']}: HTTP error {e.code}")
         return
     print(f"▪ {a['name']} <{a['email']}>")
     try:
@@ -166,12 +166,12 @@ def show_status(a):
         for unit, label in ((3, "5-hour"), (6, "weekly")):
             if unit in q:
                 x = q[unit]
-                remaining = 100 - x["percentage"]  # percentage سرور = مصرف‌شده
-                print(f"   {label:7s}: {remaining:3d}% مانده، reset بعدی تا {fmt_ts(x.get('nextResetTime'))}")
-    print(f"   Reset آماده: هفتگی ×{len(s['week'])}", end="")
+                remaining = 100 - x["percentage"]  # server percentage = used
+                print(f"   {label:7s}: {remaining:3d}% left, next natural reset in {fmt_ts(x.get('nextResetTime'))}")
+    print(f"   Gift resets: weekly ×{len(s['week'])}", end="")
     if s["week"]:
-        print(f"  (نزدیک‌ترین انقضا تا {fmt_ts(min(s['week']))})", end="")
-    print(f" | ۵ساعته ×{len(s['five_hour'])}")
+        print(f"  (soonest expires in {fmt_ts(min(s['week']))})", end="")
+    print(f" | 5-hour ×{len(s['five_hour'])}")
 
 def cmd_status():
     for a in all_accounts():
@@ -180,42 +180,42 @@ def cmd_status():
 def cmd_reset(name=None, rtype=None, yes=False):
     accs = all_accounts()
     if not accs:
-        sys.exit("اکانتی یافت نشد.")
+        sys.exit("No accounts found.")
     acc = accs[0]
     if name or len(accs) > 1:
         for i, a in enumerate(accs, 1):
             print(f" {i}) {a['name']} <{a['email']}>")
-        idx = name or input("شماره اکانت: ")
+        idx = name or input("Account number: ")
         acc = accs[int(idx) - 1]
     s = reset_status(acc)
     avail = [("week", s["week"]), ("five_hour", s["five_hour"])]
     avail = [(t, v) for t, v in avail if v]
     if not avail:
-        sys.exit(f"Reset آماده‌ای برای {acc['name']} وجود ندارد.")
+        sys.exit(f"No available resets for {acc['name']} .")
     if not rtype:
         for i, (t, v) in enumerate(avail, 1):
             print(f" {i}) {t} ×{len(v)}")
-        rtype = avail[int(input("کدام reset؟ ")) - 1][0]
+        rtype = avail[int(input("Which reset? ")) - 1][0]
     if rtype not in ("week", "five_hour"):
-        sys.exit("نوع نامعتبر (week | five_hour)")
+        sys.exit("Invalid type (week | five_hour)")
     if not yes:
-        r = input(f"مصرف یک reset {rtype} برای {acc['name']}؟ [y/N] ")
+        r = input(f"Spend a {rtype} reset for {acc['name']}[y/N] ")
         if r.strip().lower() not in ("y", "yes"):
-            sys.exit("لغو شد.")
+            sys.exit("Cancelled.")
     api(f"{BASE_RESET}/use", acc, method="POST",
         body={"idempotency_key": uuid.uuid4().hex, "reset_type": rtype})
-    print(f"✅ Reset {rtype} برای {acc['name']} اجرا شد.")
+    print(f"✅ Reset {rtype} reset for {acc['name']} done.")
     show_status(acc)
 
 def cmd_reset_now(acc, rtype):
-    """مصرف بدون تعامل (برای watch)."""
+    """Non-interactive spend (used by watch)."""
     api(f"{BASE_RESET}/use", acc, method="POST",
         body={"idempotency_key": uuid.uuid4().hex, "reset_type": rtype})
 
 def cmd_watch(threshold_min=2.0, interval_sec=60, dry_run=False):
-    """هر reset که ≤threshold دقیقه به انقضایش مانده، بی‌قیدوشرط مصرف می‌شود."""
-    print(f"watch شروع شد (همهٔ اکانت‌ها): resetهایی که ≤{threshold_min} دقیقه به انقضایشان مانده "
-          f"خودکار مصرف می‌شوند. بررسی هر {interval_sec} ثانیه." + (" [DRY-RUN]" if dry_run else ""))
+    """Spend any reset with <=threshold minutes left before its expiry, unconditionally."""
+    print(f"watch started (all accounts): resets with <= {threshold_min:g} min left before expiry "
+          f"are spent automatically. Checking every {interval_sec}s." + (" [DRY-RUN]" if dry_run else ""))
     while True:
         try:
             for a in all_accounts():
@@ -229,15 +229,15 @@ def cmd_watch(threshold_min=2.0, interval_sec=60, dry_run=False):
                         continue
                     ts = time.strftime("%H:%M")
                     if dry_run:
-                        print(f"[{ts}] [DRY] {a['name']}: reset {rtype} مصرف می‌شد.")
+                        print(f"[{ts}] [DRY] {a['name']}: reset {rtype} would be spent.")
                         continue
                     try:
                         cmd_reset_now(a, rtype)
-                        print(f"[{ts}] ✅ reset {rtype} برای {a['name']} مصرف شد (≤{threshold_min:g} دقیقه به انقضا).")
+                        print(f"[{ts}] ✅ reset {rtype} reset for {a['name']} spent (≤{threshold_min:g} m to expiry).")
                     except urllib.error.HTTPError as e:
-                        print(f"[{ts}] ! خطای HTTP {e.code} در مصرف {rtype} ({a['name']})")
+                        print(f"[{ts}] ! HTTP error {e.code} spending {rtype} ({a['name']})")
         except Exception as e:
-            print(f"[{time.strftime('%H:%M')}] ! خطا: {e}")
+            print(f"[{time.strftime('%H:%M')}] ! error: {e}")
         time.sleep(interval_sec)
 
 def main():
@@ -267,17 +267,18 @@ def main():
         cmd_reset(name, rtype, yes)
     elif args[0] in ("-h", "--help", "help"):
         print(__doc__)
-        print("""دستورها:
-  zquota status            وضعیت سهمیه و resetهای همهٔ اکانت‌ها
-  zquota accounts          فهرست اکانت‌ها
-  zquota save              ذخیرهٔ توکن اکانت فعلی ZCode در zquota
-                           (برای چند-اکانتی: در ZCode با اکانت دوم لاگین کن، بعد zquota save)
+        print("""Commands:
+  zquota status            quota + available gift resets for all accounts
+  zquota accounts          list accounts
+  zquota save              snapshot the current ZCode login into zquota
+                           (multi-account: log in with each account in ZCode and
+                           run zquota save; supports any number of accounts)
   zquota reset [n] [type] [-y]
-                           مصرف دستی؛ type = week | five_hour
+                           spend a reset manually; type = week | five_hour
   zquota watch [--min 2] [--interval 60] [--dry-run]
-                           پایش دائمی: فقط ≤2 دقیقه به انقضا، بی‌قید مصرف می‌شود""")
+                           daemon: only spends resets within --min minutes of expiry""")
     else:
-        sys.exit(f"دستور ناشناس: {args[0]} — help را ببین.")
+        sys.exit(f"unknown command: {args[0]}  — see help.")
 
 if __name__ == "__main__":
     main()

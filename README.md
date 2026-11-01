@@ -2,7 +2,7 @@
 
 **Read and spend your z.ai / GLM Coding Plan gift quota-reset tokens from the terminal — without logging in and out of ZCode.**
 
-`zquota` is a small unofficial CLI for [ZCode](https://zcode.z.ai) users on the GLM Coding plan. It reads the OAuth tokens ZCode already stores **on your own machine**, shows every account's quota (5-hour / weekly, plus ZCode gift "reset quotas"), and can automatically spend a gift reset in its final minutes before it expires — so it never goes to waste.
+`zquota` is a small unofficial CLI for [ZCode](https://zcode.z.ai) users on the GLM Coding plan. It reads the OAuth tokens ZCode already stores **on your own machine**, shows every account's quota (5-hour / weekly, plus gift "reset quotas"), and can automatically spend a gift reset in its final minutes before it expires — so it never goes to waste.
 
 ```
 $ zquota status
@@ -42,7 +42,7 @@ ZCode keeps only the active login's tokens. To let `zquota` manage several accou
 
 1. In ZCode, log in with account **A** → run `zquota save`
 2. In ZCode, log in with account **B** → run `zquota save`
-3. Go back to whichever account you like. Done — from now on `zquota` / `watch` cover both, no more logout/login dance.
+3. …repeat for as many accounts as you have, then go back to whichever you like. Done — from now on `zquota` / `watch` cover both, no more logout/login dance.
 
 Accounts are stored in `~/.config/zquota/accounts.json` (mode `0600`). Remove an entry from that file to forget an account.
 
