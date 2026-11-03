@@ -127,13 +127,15 @@ def quota(acc):
     return lim
 
 def fmt_ts(ms):
+    """Format a server timestamp (ms) as a human duration relative to now."""
     if not ms:
-        return "-"
+        return "unknown"
     dt = ms / 1000 - time.time()
-    if dt <= 0:
-        return "now"
+    past = dt < 0
+    dt = abs(dt)
     m, h = int(dt // 60) % 60, int(dt // 3600)
-    return f"{h}h {m}m" if h else f"{m}m"
+    out = f"{h}h {m:02d}m" if h else f"{m}m"
+    return out + (" ago" if past else "")
 
 # ---------- commands ----------
 
@@ -241,6 +243,12 @@ def cmd_probe():
             h = d.get(k)
             if h:
                 print(f"   last {k[7:-8]} spend: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(h['used_at']/1000))}")
+        ok, nxt = request_opportunity(a)
+        if ok:
+            print("   opportunity: GRANTED right now")
+        else:
+            when = time.strftime('%H:%M:%S', time.localtime(nxt/1000)) if nxt else "server gave no time"
+            print(f"   opportunity: not allowed yet (next_try_at: {when})")
         if n5 == 0:
             # safe: type-validity probe with nothing to spend (expect non-3001 response)
             try:
@@ -256,40 +264,81 @@ def cmd_probe():
         else:
             print("   probe: skipped (five_hour reset available - not spending it)")
 
+def request_opportunity(acc):
+    """Ask the server for permission to spend a reset (same flow as the official client).
+    Returns (granted, next_try_at_ms)."""
+    body = json.dumps({"idempotency_key": uuid.uuid4().hex}).encode()
+    req = urllib.request.Request(f"{BASE_RESET}/opportunity", data=body, method="POST",
+        headers={"Authorization": f"Bearer {acc['zcode_jwt']}",
+                 "X-Bigmodel-Authorization": acc["zai_token"],
+                 "Bigmodel-Target-Type": "PERSONAL",
+                 "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            d = json.loads(r.read())
+            data = d.get("data") or {}
+            return bool(data.get("granted")), data.get("next_try_at")
+    except urllib.error.HTTPError as e:
+        try:
+            d = json.loads(e.read().decode(errors="replace"))
+            data = d.get("data") or {}
+            if d.get("code") == 3301:
+                return False, data.get("next_try_at")
+        except Exception:
+            pass
+        return False, None
+
 def cmd_watch(threshold_min=5.0, interval_sec=30, dry_run=False):
-    """Spend any reset with <=threshold minutes left before its expiry, unconditionally.
-    Errors are logged with the full server response; retries continue every cycle until expiry."""
+    """Spend any reset with <=threshold minutes left before its expiry.
+    Mirrors the official client: an opportunity (server permission) is requested first;
+    if the server says "not yet" (code 3301) we retry exactly at next_try_at.
+    grant state is kept per account id in-memory."""
     print(f"watch started (all accounts): resets with <= {threshold_min:g} min left before expiry "
-          f"are spent automatically (retried every cycle until expiry). Checking every {interval_sec}s."
-          + (" [DRY-RUN]" if dry_run else ""), flush=True)
+          f"are spent automatically (opportunity-gated, retried until expiry). "
+          f"Checking every {interval_sec}s." + (" [DRY-RUN]" if dry_run else ""), flush=True)
+    grant = {}   # acc_id -> {"next_try_at": ms, "granted": bool}
     while True:
         try:
             for a in all_accounts():
                 try:
-                    s = reset_status(a)
+                    st = reset_status(a)
                 except Exception as e:
                     print(f"[{time.strftime('%H:%M:%S')}] ! {a['email']}: failed to read status: {e}", flush=True)
                     continue
                 now = time.time() * 1000
                 for rtype in ("week", "five_hour"):
-                    exp = s[rtype]
+                    exp = st[rtype]
                     if not exp:
                         continue
-                    soonest = min(exp)
-                    remain_min = (soonest - now) / 60000
+                    remain_min = (min(exp) - now) / 60000
                     if remain_min > threshold_min:
                         continue
+                    g = grant.setdefault(a["id"], {"next_try_at": 0, "granted": False})
                     ts = time.strftime("%H:%M:%S")
                     if dry_run:
                         print(f"[{ts}] [DRY] {a['email']}: {rtype} reset would be spent ({remain_min:.1f} min left).", flush=True)
                         continue
+                    if not g["granted"]:
+                        if now < g["next_try_at"]:
+                            continue  # server said "not yet"; wait exactly until next_try_at
+                        ok, nxt = request_opportunity(a)
+                        if ok:
+                            g["granted"] = True
+                            print(f"[{ts}] == {a['email']}: opportunity GRANTED for {rtype}.", flush=True)
+                        else:
+                            g["next_try_at"] = nxt or (now + 10 * 60000)
+                            print(f"[{ts}] .. {a['email']}: opportunity not allowed yet "
+                                  f"(retry at {time.strftime('%H:%M:%S', time.localtime((g['next_try_at'])/1000))}).", flush=True)
+                            continue
                     try:
                         cmd_reset_now(a, rtype)
                         print(f"[{ts}] OK {rtype} reset spent for {a['email']} ({remain_min:.1f} min before expiry).", flush=True)
+                        g["granted"] = False
+                        g["next_try_at"] = 0
                     except urllib.error.HTTPError as e:
                         body = e.read().decode(errors="replace")[:300]
-                        print(f"[{ts}] ! {a['email']}: spending {rtype} failed - HTTP {e.code}: {body}"
-                              f" ({remain_min:.1f} min to expiry; will retry next cycle)", flush=True)
+                        print(f"[{ts}] ! {a['email']}: spending {rtype} failed - HTTP {e.code}: {body} "
+                              f"({remain_min:.1f} min to expiry; will retry)", flush=True)
                     except Exception as e:
                         print(f"[{ts}] ! {a['email']}: spending {rtype} failed: {e}", flush=True)
         except Exception as e:
